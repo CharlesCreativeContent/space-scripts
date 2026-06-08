@@ -2,6 +2,7 @@
 """Convert a .ts (MPEG Transport Stream) file into 2-hour MP3 segments."""
 
 import argparse
+import math
 import shutil
 import subprocess
 import sys
@@ -66,18 +67,81 @@ def validate_input(path: Path) -> None:
         raise ValueError(f"File is empty: {path}")
 
 
+def probe_duration(input_path: Path) -> float | None:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "quiet",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0",
+            str(input_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        try:
+            return float(result.stdout.strip())
+        except ValueError:
+            pass
+    return None
+
+
+_VBR_KBPS = {0: 245, 1: 225, 2: 190, 3: 175, 4: 165, 5: 130, 6: 115, 7: 100, 8: 85, 9: 65}
+
+
+def _parse_bitrate_bps(bitrate_str: str) -> int:
+    s = bitrate_str.strip().lower()
+    if s.endswith("k"):
+        return int(float(s[:-1]) * 1000)
+    if s.endswith("m"):
+        return int(float(s[:-1]) * 1_000_000)
+    return int(s)
+
+
+def _estimate_output_bytes(duration_secs: float, quality_args: list[str]) -> int:
+    if "-b:a" in quality_args:
+        bitrate_bps = _parse_bitrate_bps(quality_args[quality_args.index("-b:a") + 1])
+    else:
+        quality = int(quality_args[quality_args.index("-q:a") + 1])
+        bitrate_bps = _VBR_KBPS.get(quality, 190) * 1000
+    return int(duration_secs * bitrate_bps / 8 * 1.1)  # 10% headroom
+
+
+def check_disk_space(output_dir: Path, duration_secs: float, quality_args: list[str]) -> None:
+    needed = _estimate_output_bytes(duration_secs, quality_args)
+    free = shutil.disk_usage(output_dir).free
+    if needed > free:
+        needed_mb = needed / (1024 * 1024)
+        free_mb = free / (1024 * 1024)
+        raise ValueError(
+            f"Insufficient disk space: need ~{needed_mb:.0f} MB, only {free_mb:.0f} MB free"
+        )
+
+
+def _fmt_duration(secs: float) -> str:
+    h = int(secs) // 3600
+    m = (int(secs) % 3600) // 60
+    s = int(secs) % 60
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
 def convert(
     input_path: Path,
     output_dir: Path,
     segment_duration: int,
     quality_args: list[str],
+    duration: float | None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-
     output_pattern = output_dir / f"{input_path.stem}_part%03d.mp3"
 
     cmd = [
         "ffmpeg",
+        "-hide_banner",
         "-i", str(input_path),
         "-vn",
         "-acodec", "libmp3lame",
@@ -88,21 +152,30 @@ def convert(
         str(output_pattern),
     ]
 
-    print(f"Input:   {input_path}")
-    print(f"Output:  {output_dir / (input_path.stem + '_part*.mp3')}")
-    print(f"Segment: {segment_duration}s ({segment_duration // 3600}h {(segment_duration % 3600) // 60}m)")
+    print(f"Input:    {input_path}", end="")
+    if duration is not None:
+        n_segments = math.ceil(duration / segment_duration)
+        est_mb = _estimate_output_bytes(duration, quality_args) / (1024 * 1024)
+        print(f"  ({_fmt_duration(duration)})")
+        print(f"Output:   {output_dir / (input_path.stem + '_part*.mp3')}")
+        print(f"Segments: {n_segments} × {_fmt_duration(segment_duration)}")
+        print(f"Est. size: ~{est_mb:.0f} MB total")
+    else:
+        print()
+        print(f"Output:   {output_dir / (input_path.stem + '_part*.mp3')}")
+        print(f"Segment:  {_fmt_duration(segment_duration)}")
     print()
 
     try:
         result = subprocess.run(cmd, capture_output=False)
     except KeyboardInterrupt:
-        print("\nInterrupted — cleaning up partial files...", file=sys.stderr)
-        _cleanup_partial_files(output_dir, input_path.stem)
+        print("\nInterrupted — removing partial segment, keeping completed ones...", file=sys.stderr)
+        _cleanup_last_segment(output_dir, input_path.stem)
         sys.exit(130)
 
     if result.returncode != 0:
-        print("\nffmpeg failed — cleaning up partial files...", file=sys.stderr)
-        _cleanup_partial_files(output_dir, input_path.stem)
+        print("\nffmpeg failed — removing partial segment, keeping completed ones...", file=sys.stderr)
+        _cleanup_last_segment(output_dir, input_path.stem)
         sys.exit(3)
 
     segments = sorted(output_dir.glob(f"{input_path.stem}_part*.mp3"))
@@ -112,12 +185,19 @@ def convert(
         print(f"  {seg.name}  ({size_mb:.1f} MB)")
 
 
-def _cleanup_partial_files(output_dir: Path, stem: str) -> None:
-    for f in output_dir.glob(f"{stem}_part*.mp3"):
-        try:
-            f.unlink()
-        except OSError:
-            pass
+def _cleanup_last_segment(output_dir: Path, stem: str) -> None:
+    """Remove only the last (potentially partial) segment; keep completed ones."""
+    files = sorted(output_dir.glob(f"{stem}_part*.mp3"))
+    if not files:
+        return
+    partial = files[-1]
+    try:
+        partial.unlink()
+        print(f"  Removed partial: {partial.name}", file=sys.stderr)
+    except OSError:
+        pass
+    if len(files) > 1:
+        print(f"  Kept {len(files) - 1} completed segment(s) in {output_dir}", file=sys.stderr)
 
 
 def main() -> None:
@@ -152,7 +232,16 @@ def main() -> None:
     else:
         quality_args = ["-q:a", str(args.quality)]
 
-    convert(input_path, output_dir, args.segment_duration, quality_args)
+    duration = probe_duration(input_path)
+
+    if duration is not None:
+        try:
+            check_disk_space(output_dir, duration, quality_args)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(2)
+
+    convert(input_path, output_dir, args.segment_duration, quality_args, duration)
 
 
 if __name__ == "__main__":
