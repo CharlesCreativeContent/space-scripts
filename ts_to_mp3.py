@@ -139,11 +139,79 @@ def convert(
     duration: float | None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if duration is None:
+        # Duration unknown — fall back to segment muxer
+        _convert_segment_muxer(input_path, output_dir, segment_duration, quality_args)
+        return
+
+    n_segments = math.ceil(duration / segment_duration)
+    est_mb = _estimate_output_bytes(duration, quality_args) / (1024 * 1024)
+
+    print(f"Input:    {input_path}  ({_fmt_duration(duration)})")
+    print(f"Output:   {output_dir / (input_path.stem + '_part*.mp3')}")
+    print(f"Segments: {n_segments} × {_fmt_duration(segment_duration)}")
+    print(f"Est. size: ~{est_mb:.0f} MB total")
+    print()
+
+    for i in range(n_segments):
+        start = i * segment_duration
+        end = min(start + segment_duration, duration)
+        output_file = output_dir / f"{input_path.stem}_part{i:03d}.mp3"
+
+        cmd = [
+            "ffmpeg", "-hide_banner",
+            "-ss", str(start),
+            "-i", str(input_path),
+            "-t", str(segment_duration),
+            "-vn",
+            "-acodec", "libmp3lame",
+            *quality_args,
+            str(output_file),
+        ]
+
+        print(f"[{i + 1}/{n_segments}] {_fmt_duration(start)} → {_fmt_duration(end)}")
+
+        try:
+            result = subprocess.run(cmd, capture_output=False)
+        except KeyboardInterrupt:
+            print("\nInterrupted — removing partial segment, keeping completed ones...", file=sys.stderr)
+            output_file.unlink(missing_ok=True)
+            if i > 0:
+                print(f"  Kept {i} completed segment(s) in {output_dir}", file=sys.stderr)
+            sys.exit(130)
+
+        if result.returncode != 0:
+            print(f"\nffmpeg failed on segment {i + 1} — removing partial output...", file=sys.stderr)
+            output_file.unlink(missing_ok=True)
+            if i > 0:
+                print(f"  Kept {i} completed segment(s) in {output_dir}", file=sys.stderr)
+            sys.exit(3)
+
+    segments = sorted(output_dir.glob(f"{input_path.stem}_part*.mp3"))
+    print(f"\nDone. Created {len(segments)} segment(s):")
+    for seg in segments:
+        size_mb = seg.stat().st_size / (1024 * 1024)
+        print(f"  {seg.name}  ({size_mb:.1f} MB)")
+
+
+def _convert_segment_muxer(
+    input_path: Path,
+    output_dir: Path,
+    segment_duration: int,
+    quality_args: list[str],
+) -> None:
+    """Fallback: single-pass segment muxer when duration cannot be probed."""
     output_pattern = output_dir / f"{input_path.stem}_part%03d.mp3"
 
+    print(f"Input:    {input_path}")
+    print(f"Output:   {output_dir / (input_path.stem + '_part*.mp3')}")
+    print(f"Segment:  {_fmt_duration(segment_duration)}")
+    print(f"Note: duration unknown — using segment muxer (may miss content near end)")
+    print()
+
     cmd = [
-        "ffmpeg",
-        "-hide_banner",
+        "ffmpeg", "-hide_banner",
         "-i", str(input_path),
         "-vn",
         "-acodec", "libmp3lame",
@@ -153,20 +221,6 @@ def convert(
         "-reset_timestamps", "1",
         str(output_pattern),
     ]
-
-    print(f"Input:    {input_path}", end="")
-    if duration is not None:
-        n_segments = math.ceil(duration / segment_duration)
-        est_mb = _estimate_output_bytes(duration, quality_args) / (1024 * 1024)
-        print(f"  ({_fmt_duration(duration)})")
-        print(f"Output:   {output_dir / (input_path.stem + '_part*.mp3')}")
-        print(f"Segments: {n_segments} × {_fmt_duration(segment_duration)}")
-        print(f"Est. size: ~{est_mb:.0f} MB total")
-    else:
-        print()
-        print(f"Output:   {output_dir / (input_path.stem + '_part*.mp3')}")
-        print(f"Segment:  {_fmt_duration(segment_duration)}")
-    print()
 
     try:
         result = subprocess.run(cmd, capture_output=False)
@@ -188,7 +242,6 @@ def convert(
 
 
 def _cleanup_last_segment(output_dir: Path, stem: str) -> None:
-    """Remove only the last (potentially partial) segment; keep completed ones."""
     files = sorted(output_dir.glob(f"{stem}_part*.mp3"))
     if not files:
         return
