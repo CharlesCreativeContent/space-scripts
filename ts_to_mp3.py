@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Convert a .ts (MPEG Transport Stream) file into 2-hour MP3 segments."""
 
+from __future__ import annotations
+
 import argparse
 import math
 import shutil
